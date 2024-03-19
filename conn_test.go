@@ -482,31 +482,33 @@ func TestPrepareBadSQLFailure(t *testing.T) {
 func TestPrepareIdempotency(t *testing.T) {
 	t.Parallel()
 
-	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
-	defer closeConn(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
 
-	for i := 0; i < 2; i++ {
-		_, err := conn.Prepare(context.Background(), "test", "select 42::integer")
-		if err != nil {
-			t.Fatalf("%d. Unable to prepare statement: %v", i, err)
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		for i := 0; i < 2; i++ {
+			_, err := conn.Prepare(context.Background(), "test", "select 42::integer")
+			if err != nil {
+				t.Fatalf("%d. Unable to prepare statement: %v", i, err)
+			}
+
+			var n int32
+			err = conn.QueryRow(context.Background(), "test").Scan(&n)
+			if err != nil {
+				t.Errorf("%d. Executing prepared statement failed: %v", i, err)
+			}
+
+			if n != int32(42) {
+				t.Errorf("%d. Prepared statement did not return expected value: %v", i, n)
+			}
 		}
 
-		var n int32
-		err = conn.QueryRow(context.Background(), "test").Scan(&n)
-		if err != nil {
-			t.Errorf("%d. Executing prepared statement failed: %v", i, err)
+		_, err := conn.Prepare(context.Background(), "test", "select 'fail'::varchar")
+		if err == nil {
+			t.Fatalf("Prepare statement with same name but different SQL should have failed but it didn't")
+			return
 		}
-
-		if n != int32(42) {
-			t.Errorf("%d. Prepared statement did not return expected value: %v", i, n)
-		}
-	}
-
-	_, err := conn.Prepare(context.Background(), "test", "select 'fail'::varchar")
-	if err == nil {
-		t.Fatalf("Prepare statement with same name but different SQL should have failed but it didn't")
-		return
-	}
+	})
 }
 
 func TestPrepareStatementCacheModes(t *testing.T) {
@@ -523,6 +525,91 @@ func TestPrepareStatementCacheModes(t *testing.T) {
 		err = conn.QueryRow(context.Background(), "test", "hello").Scan(&s)
 		require.NoError(t, err)
 		require.Equal(t, "hello", s)
+	})
+}
+
+func TestPrepareWithDigestedName(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		sql := "select $1::text"
+		sd, err := conn.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+
+		var s string
+		err = conn.QueryRow(ctx, sql, "hello").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s)
+
+		err = conn.Deallocate(ctx, sql)
+		require.NoError(t, err)
+	})
+}
+
+// https://github.com/jackc/pgx/pull/1795
+func TestDeallocateInAbortedTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+
+		sql := "select $1::text"
+		sd, err := tx.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+
+		var s string
+		err = tx.QueryRow(ctx, sql, "hello").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s)
+
+		_, err = tx.Exec(ctx, "select 1/0") // abort transaction with divide by zero error
+		require.Error(t, err)
+
+		err = conn.Deallocate(ctx, sql)
+		require.NoError(t, err)
+
+		err = tx.Rollback(ctx)
+		require.NoError(t, err)
+
+		sd, err = conn.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+	})
+}
+
+func TestDeallocateMissingPreparedStatementStillClearsFromPreparedStatementMap(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Prepare(ctx, "ps", "select $1::text")
+		require.NoError(t, err)
+
+		_, err = conn.Exec(ctx, "deallocate ps")
+		require.NoError(t, err)
+
+		err = conn.Deallocate(ctx, "ps")
+		require.NoError(t, err)
+
+		_, err = conn.Prepare(ctx, "ps", "select $1::text, $2::text")
+		require.NoError(t, err)
+
+		var s1, s2 string
+		err = conn.QueryRow(ctx, "ps", "hello", "world").Scan(&s1, &s2)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s1)
+		require.Equal(t, "world", s2)
 	})
 }
 
@@ -1250,4 +1337,74 @@ func TestRawValuesUnderlyingMemoryReused(t *testing.T) {
 
 		t.Fatal("expected buffer from RawValues to be overwritten by subsequent queries but it was not")
 	})
+}
+
+// https://github.com/jackc/pgx/issues/1847
+func TestConnDeallocateInvalidatedCachedStatementsWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "CockroachDB returns decimal instead of integer for integer division")
+
+		var n int32
+		err := conn.QueryRow(ctx, "select 1 / $1::int", 1).Scan(&n)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, n)
+
+		// Divide by zero causes an error. baseRows.Close() calls Invalidate on the statement cache whenever an error was
+		// encountered by the query. Use this to purposely invalidate the query. If we had access to private fields of conn
+		// we could call conn.statementCache.InvalidateAll() instead.
+		err = conn.QueryRow(ctx, "select 1 / $1::int", 0).Scan(&n)
+		require.Error(t, err)
+
+		ctx2, cancel2 := context.WithCancel(ctx)
+		cancel2()
+		err = conn.QueryRow(ctx2, "select 1 / $1::int", 1).Scan(&n)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+
+		err = conn.QueryRow(ctx, "select 1 / $1::int", 1).Scan(&n)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, n)
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1847
+func TestConnDeallocateInvalidatedCachedStatementsInTransactionWithBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	connString := os.Getenv("PGX_TEST_DATABASE")
+	config := mustParseConfig(t, connString)
+	config.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
+	config.StatementCacheCapacity = 2
+
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, "select $1::int + 1", 1)
+	require.NoError(t, err)
+
+	_, err = tx.Exec(ctx, "select $1::int + 2", 1)
+	require.NoError(t, err)
+
+	// This should invalidate the first cached statement.
+	_, err = tx.Exec(ctx, "select $1::int + 3", 1)
+	require.NoError(t, err)
+
+	batch := &pgx.Batch{}
+	batch.Queue("select $1::int + 1", 1)
+	err = tx.SendBatch(ctx, batch).Close()
+	require.NoError(t, err)
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	ensureConnValid(t, conn)
 }
