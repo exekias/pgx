@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -34,6 +35,7 @@ func init() {
 // Test for renamed types
 type _string string
 type _bool bool
+type _uint8 uint8
 type _int8 int8
 type _int16 int16
 type _int16Slice []int16
@@ -43,7 +45,7 @@ type _float32Slice []float32
 type _float64Slice []float64
 type _byteSlice []byte
 
-// unregisteredOID represents a actual type that is not registered. Cannot use 0 because that represents that the type
+// unregisteredOID represents an actual type that is not registered. Cannot use 0 because that represents that the type
 // is not known (e.g. when using the simple protocol).
 const unregisteredOID = uint32(1)
 
@@ -417,6 +419,14 @@ func TestMapEncodeByteSliceIntoUnregisteredTypeTextFormat(t *testing.T) {
 	require.Equal(t, []byte(`\x00010203`), buf)
 }
 
+// https://github.com/jackc/pgx/issues/1763
+func TestMapEncodeNamedTypeOfByteSliceIntoTextTextFormat(t *testing.T) {
+	m := pgtype.NewMap()
+	buf, err := m.Encode(pgtype.TextOID, pgtype.TextFormatCode, json.RawMessage(`{"foo": "bar"}`), nil)
+	require.NoError(t, err)
+	require.Equal(t, []byte(`{"foo": "bar"}`), buf)
+}
+
 // https://github.com/jackc/pgx/issues/1326
 func TestMapScanPointerToRenamedType(t *testing.T) {
 	srcBuf := []byte("foo")
@@ -442,6 +452,14 @@ func TestMapScanNullToWrongType(t *testing.T) {
 	err = m.Scan(pgtype.TextOID, pgx.TextFormatCode, nil, &pn)
 	assert.NoError(t, err)
 	assert.False(t, pn.Valid)
+}
+
+func TestScanToSliceOfRenamedUint8(t *testing.T) {
+	m := pgtype.NewMap()
+	var ruint8 []_uint8
+	err := m.Scan(pgtype.Int2ArrayOID, pgx.TextFormatCode, []byte("{2,4}"), &ruint8)
+	assert.NoError(t, err)
+	assert.Equal(t, []_uint8{2, 4}, ruint8)
 }
 
 func TestMapScanTextToBool(t *testing.T) {
@@ -526,6 +544,14 @@ func TestMapEncodePlanCacheUUIDTypeConfusion(t *testing.T) {
 		[]string{"00010203-0405-0607-0809-0a0b0c0d0e0f", "0f0e0d0c-0b0a-0908-0706-0504-03020100"},
 		nil)
 	require.Error(t, err)
+}
+
+// https://github.com/jackc/pgx/issues/1763
+func TestMapEncodeRawJSONIntoUnknownOID(t *testing.T) {
+	m := pgtype.NewMap()
+	buf, err := m.Encode(0, pgtype.TextFormatCode, json.RawMessage(`{"foo": "bar"}`), nil)
+	require.NoError(t, err)
+	require.Equal(t, []byte(`{"foo": "bar"}`), buf)
 }
 
 func BenchmarkMapScanInt4IntoBinaryDecoder(b *testing.B) {

@@ -17,15 +17,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/internal/pgio"
 	"github.com/jackc/pgx/v5/internal/pgmock"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
+
+const pgbouncerConnStringEnvVar = "PGX_TEST_PGBOUNCER_CONN_STRING"
 
 func TestConnect(t *testing.T) {
 	tests := []struct {
@@ -249,9 +252,7 @@ func TestConnectTimeout(t *testing.T) {
 				}
 			}()
 
-			parts := strings.Split(ln.Addr().String(), ":")
-			host := parts[0]
-			port := parts[1]
+			host, port, _ := strings.Cut(ln.Addr().String(), ":")
 			connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
 			tooLate := time.Now().Add(time.Millisecond * 500)
 
@@ -316,9 +317,7 @@ func TestConnectTimeoutStuckOnTLSHandshake(t *testing.T) {
 				time.Sleep(time.Minute)
 			}()
 
-			parts := strings.Split(ln.Addr().String(), ":")
-			host := parts[0]
-			port := parts[1]
+			host, port, _ := strings.Cut(ln.Addr().String(), ":")
 			connStr := fmt.Sprintf("host=%s port=%s", host, port)
 
 			errChan := make(chan error)
@@ -442,7 +441,7 @@ func TestConnectCustomLookupWithPort(t *testing.T) {
 	require.NoError(t, err)
 
 	origPort := config.Port
-	// Chnage the config an invalid port so it will fail if used
+	// Change the config an invalid port so it will fail if used
 	config.Port = 0
 
 	looked := false
@@ -658,6 +657,89 @@ func TestConnPrepareContextPrecanceled(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, context.Canceled))
 	assert.True(t, pgconn.SafeToRetry(err))
+
+	ensureConnValid(t, pgConn)
+}
+
+func TestConnDeallocate(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	_, err = pgConn.Prepare(ctx, "ps1", "select 1", nil)
+	require.NoError(t, err)
+
+	_, err = pgConn.ExecPrepared(ctx, "ps1", nil, nil, nil).Close()
+	require.NoError(t, err)
+
+	err = pgConn.Deallocate(ctx, "ps1")
+	require.NoError(t, err)
+
+	_, err = pgConn.ExecPrepared(ctx, "ps1", nil, nil, nil).Close()
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "26000", pgErr.Code)
+
+	ensureConnValid(t, pgConn)
+}
+
+func TestConnDeallocateSucceedsInAbortedTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	err = pgConn.Exec(ctx, "begin").Close()
+	require.NoError(t, err)
+
+	_, err = pgConn.Prepare(ctx, "ps1", "select 1", nil)
+	require.NoError(t, err)
+
+	_, err = pgConn.ExecPrepared(ctx, "ps1", nil, nil, nil).Close()
+	require.NoError(t, err)
+
+	err = pgConn.Exec(ctx, "select 1/0").Close() // break transaction with divide by 0 error
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "22012", pgErr.Code)
+
+	err = pgConn.Deallocate(ctx, "ps1")
+	require.NoError(t, err)
+
+	err = pgConn.Exec(ctx, "rollback").Close()
+	require.NoError(t, err)
+
+	_, err = pgConn.ExecPrepared(ctx, "ps1", nil, nil, nil).Close()
+	require.Error(t, err)
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "26000", pgErr.Code)
+
+	ensureConnValid(t, pgConn)
+}
+
+func TestConnDeallocateNonExistantStatementSucceeds(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	err = pgConn.Deallocate(ctx, "ps1")
+	require.NoError(t, err)
 
 	ensureConnValid(t, pgConn)
 }
@@ -2260,18 +2342,44 @@ func TestConnCancelRequest(t *testing.T) {
 func TestConnContextCanceledCancelsRunningQueryOnServer(t *testing.T) {
 	t.Parallel()
 
+	t.Run("postgres", func(t *testing.T) {
+		t.Parallel()
+
+		testConnContextCanceledCancelsRunningQueryOnServer(t, os.Getenv("PGX_TEST_DATABASE"), "postgres")
+	})
+
+	t.Run("pgbouncer", func(t *testing.T) {
+		t.Parallel()
+
+		connString := os.Getenv(pgbouncerConnStringEnvVar)
+		if connString == "" {
+			t.Skipf("Skipping due to missing environment variable %v", pgbouncerConnStringEnvVar)
+		}
+
+		testConnContextCanceledCancelsRunningQueryOnServer(t, connString, "pgbouncer")
+	})
+}
+
+func testConnContextCanceledCancelsRunningQueryOnServer(t *testing.T, connString, dbType string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	pgConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	pgConn, err := pgconn.Connect(ctx, connString)
 	require.NoError(t, err)
 	defer closeConn(t, pgConn)
 
-	pid := pgConn.PID()
-
 	ctx, cancel = context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
-	multiResult := pgConn.Exec(ctx, "select 'Hello, world', pg_sleep(30)")
+
+	// Getting the actual PostgreSQL server process ID (PID) from a query executed through pgbouncer is not straightforward
+	// because pgbouncer abstracts the underlying database connections, and it doesn't expose the PID of the PostgreSQL
+	// server process to clients. However, we can check if the query is running by checking the generated query ID.
+	queryID := fmt.Sprintf("%s testConnContextCanceled %d", dbType, time.Now().UnixNano())
+
+	multiResult := pgConn.Exec(ctx, fmt.Sprintf(`
+	-- %v
+	select 'Hello, world', pg_sleep(30)
+	`, queryID))
 
 	for multiResult.NextResult() {
 	}
@@ -2287,7 +2395,7 @@ func TestConnContextCanceledCancelsRunningQueryOnServer(t *testing.T) {
 	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	otherConn, err := pgconn.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
+	otherConn, err := pgconn.Connect(ctx, connString)
 	require.NoError(t, err)
 	defer closeConn(t, otherConn)
 
@@ -2296,8 +2404,8 @@ func TestConnContextCanceledCancelsRunningQueryOnServer(t *testing.T) {
 
 	for {
 		result := otherConn.ExecParams(ctx,
-			`select 1 from pg_stat_activity where pid=$1`,
-			[][]byte{[]byte(strconv.FormatInt(int64(pid), 10))},
+			`select 1 from pg_stat_activity where query like $1`,
+			[][]byte{[]byte("%" + queryID + "%")},
 			nil,
 			nil,
 			nil,
@@ -2414,9 +2522,7 @@ func TestFatalErrorReceivedAfterCommandComplete(t *testing.T) {
 		}
 	}()
 
-	parts := strings.Split(ln.Addr().String(), ":")
-	host := parts[0]
-	port := parts[1]
+	host, port, _ := strings.Cut(ln.Addr().String(), ":")
 	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
 
 	ctx, cancel = context.WithTimeout(ctx, 5*time.Second)
@@ -3042,6 +3148,41 @@ func TestPipelineCloseDetectsUnsyncedRequests(t *testing.T) {
 	require.EqualError(t, err, "pipeline has unsynced requests")
 }
 
+func TestConnOnPgError(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	config, err := pgconn.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
+	require.NoError(t, err)
+	config.OnPgError = func(c *pgconn.PgConn, pgErr *pgconn.PgError) bool {
+		require.NotNil(t, c)
+		require.NotNil(t, pgErr)
+		// close connection on undefined tables only
+		if pgErr.Code == "42P01" {
+			return false
+		}
+		return true
+	}
+
+	pgConn, err := pgconn.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+	defer closeConn(t, pgConn)
+
+	_, err = pgConn.Exec(ctx, "select 'Hello, world'").ReadAll()
+	assert.NoError(t, err)
+	assert.False(t, pgConn.IsClosed())
+
+	_, err = pgConn.Exec(ctx, "select 1/0").ReadAll()
+	assert.Error(t, err)
+	assert.False(t, pgConn.IsClosed())
+
+	_, err = pgConn.Exec(ctx, "select * from non_existant_table").ReadAll()
+	assert.Error(t, err)
+	assert.True(t, pgConn.IsClosed())
+}
+
 func Example() {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -3218,18 +3359,18 @@ func TestSNISupport(t *testing.T) {
 				defer srv.Close()
 
 				if err := srv.Handshake(); err != nil {
-					serverErrChan <- fmt.Errorf("handshake: %v", err)
+					serverErrChan <- fmt.Errorf("handshake: %w", err)
 					return
 				}
 
-				srv.Write((&pgproto3.AuthenticationOk{}).Encode(nil))
-				srv.Write((&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}).Encode(nil))
-				srv.Write((&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil))
+				srv.Write(mustEncode((&pgproto3.AuthenticationOk{}).Encode(nil)))
+				srv.Write(mustEncode((&pgproto3.BackendKeyData{ProcessID: 0, SecretKey: 0}).Encode(nil)))
+				srv.Write(mustEncode((&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(nil)))
 
 				serverSNINameChan <- sniHost
 			}()
 
-			port := strings.Split(ln.Addr().String(), ":")[1]
+			_, port, _ := strings.Cut(ln.Addr().String(), ":")
 			connStr := fmt.Sprintf("sslmode=require host=localhost port=%s %s", port, tt.sni_param)
 			_, err = pgconn.Connect(ctx, connStr)
 
@@ -3247,4 +3388,94 @@ func TestSNISupport(t *testing.T) {
 			}
 		})
 	}
+}
+
+// https://github.com/jackc/pgx/issues/1920
+func TestFatalErrorReceivedInPipelineMode(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	steps := pgmock.AcceptUnauthenticatedConnRequestSteps()
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Parse{}))
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Describe{}))
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Parse{}))
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Describe{}))
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Parse{}))
+	steps = append(steps, pgmock.ExpectAnyMessage(&pgproto3.Describe{}))
+	steps = append(steps, pgmock.SendMessage(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+		{Name: []byte("mock")},
+	}}))
+	steps = append(steps, pgmock.SendMessage(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "57P01"}))
+	// We shouldn't get anything after the first fatal error. But the reported issue was with PgBouncer so maybe that
+	// causes the issue. Anyway, a FATAL error after the connection had already been killed could cause a panic.
+	steps = append(steps, pgmock.SendMessage(&pgproto3.ErrorResponse{Severity: "FATAL", Code: "57P01"}))
+
+	script := &pgmock.Script{Steps: steps}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	serverKeepAlive := make(chan struct{})
+	defer close(serverKeepAlive)
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		defer close(serverErrChan)
+
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		defer conn.Close()
+
+		err = conn.SetDeadline(time.Now().Add(59 * time.Second))
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		err = script.Run(pgproto3.NewBackend(conn, conn))
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+
+		<-serverKeepAlive
+	}()
+
+	parts := strings.Split(ln.Addr().String(), ":")
+	host := parts[0]
+	port := parts[1]
+	connStr := fmt.Sprintf("sslmode=disable host=%s port=%s", host, port)
+
+	ctx, cancel = context.WithTimeout(ctx, 59*time.Second)
+	defer cancel()
+	conn, err := pgconn.Connect(ctx, connStr)
+	require.NoError(t, err)
+
+	pipeline := conn.StartPipeline(ctx)
+	pipeline.SendPrepare("s1", "select 1", nil)
+	pipeline.SendPrepare("s2", "select 2", nil)
+	pipeline.SendPrepare("s3", "select 3", nil)
+	err = pipeline.Sync()
+	require.NoError(t, err)
+
+	_, err = pipeline.GetResults()
+	require.NoError(t, err)
+	_, err = pipeline.GetResults()
+	require.Error(t, err)
+
+	err = pipeline.Close()
+	require.Error(t, err)
+}
+
+func mustEncode(buf []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return buf
 }
