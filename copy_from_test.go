@@ -802,3 +802,93 @@ func TestConnCopyFromAutomaticStringConversion(t *testing.T) {
 
 	ensureConnValid(t, conn)
 }
+
+// https://github.com/jackc/pgx/discussions/1891
+func TestConnCopyFromAutomaticStringConversionArray(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	mustExec(t, conn, `create temporary table foo(
+		a numeric[]
+	)`)
+
+	inputRows := [][]interface{}{
+		{[]string{"42"}},
+		{[]string{"7"}},
+		{[]string{"8", "9"}},
+		{[][]string{{"10", "11"}, {"12", "13"}}},
+	}
+
+	copyCount, err := conn.CopyFrom(ctx, pgx.Identifier{"foo"}, []string{"a"}, pgx.CopyFromRows(inputRows))
+	require.NoError(t, err)
+	require.EqualValues(t, len(inputRows), copyCount)
+
+	// Test reads as int64 and flattened array for simplicity.
+	rows, _ := conn.Query(ctx, "select * from foo")
+	nums, err := pgx.CollectRows(rows, pgx.RowTo[[]int64])
+	require.NoError(t, err)
+	require.Equal(t, [][]int64{{42}, {7}, {8, 9}, {10, 11, 12, 13}}, nums)
+
+	ensureConnValid(t, conn)
+}
+
+func TestCopyFromFunc(t *testing.T) {
+	t.Parallel()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	mustExec(t, conn, `create temporary table foo(
+		a int
+	)`)
+
+	dataCh := make(chan int, 1)
+
+	const channelItems = 10
+	go func() {
+		for i := 0; i < channelItems; i++ {
+			dataCh <- i
+		}
+		close(dataCh)
+	}()
+
+	copyCount, err := conn.CopyFrom(context.Background(), pgx.Identifier{"foo"}, []string{"a"},
+		pgx.CopyFromFunc(func() ([]any, error) {
+			v, ok := <-dataCh
+			if !ok {
+				return nil, nil
+			}
+			return []any{v}, nil
+		}))
+
+	require.ErrorIs(t, err, nil)
+	require.EqualValues(t, channelItems, copyCount)
+
+	rows, err := conn.Query(context.Background(), "select * from foo order by a")
+	require.NoError(t, err)
+	nums, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	require.NoError(t, err)
+	require.Equal(t, []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, nums)
+
+	// simulate a failure
+	copyCount, err = conn.CopyFrom(context.Background(), pgx.Identifier{"foo"}, []string{"a"},
+		pgx.CopyFromFunc(func() func() ([]any, error) {
+			x := 9
+			return func() ([]any, error) {
+				x++
+				if x > 100 {
+					return nil, fmt.Errorf("simulated error")
+				}
+				return []any{x}, nil
+			}
+		}()))
+	require.NotErrorIs(t, err, nil)
+	require.EqualValues(t, 0, copyCount) // no change, due to error
+
+	ensureConnValid(t, conn)
+}
